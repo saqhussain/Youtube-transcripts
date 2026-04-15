@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "functions": {
+    "api/transcript.js": {
+      "maxDuration": 30
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/transcript",
+      "dest": "/api/transcript.js"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/transcript.js"
+    }
+  ]
+}

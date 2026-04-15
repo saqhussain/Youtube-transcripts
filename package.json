@@ -1,0 +1,6 @@
+{
+  "name": "yt-transcript-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "YouTube transcript fetcher API for Misinfo Checker"
+}
