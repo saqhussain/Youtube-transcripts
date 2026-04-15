@@ -1,179 +1,139 @@
-const https = require('https');
-const http = require('http');
-
 module.exports = async (req, res) => {
-  // CORS headers
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const videoId = url.searchParams.get('videoId') || (req.body && req.body.videoId);
+  const videoId = url.searchParams.get('videoId');
   const action = url.searchParams.get('action') || 'transcript';
 
   if (action === 'ping') {
-    return res.status(200).json({ success: true, message: 'YouTube Transcript API running' });
+    return res.status(200).json({ success: true, message: 'Transcript API v4 running' });
   }
 
-  if (!videoId) {
-    return res.status(400).json({ error: 'Missing videoId parameter' });
-  }
-
-  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-    return res.status(400).json({ error: 'Invalid videoId format' });
-  }
+  if (!videoId) return res.status(400).json({ error: 'Missing videoId parameter' });
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid videoId' });
 
   try {
-    const transcript = await fetchTranscript(videoId);
-    
+    const result = await fetchTranscript(videoId);
     if (action === 'test') {
-      return res.status(200).json({ 
-        success: true, 
-        videoId, 
-        available: transcript.text.length > 50, 
-        length: transcript.text.length,
-        type: transcript.type 
-      });
+      return res.status(200).json({ success: true, videoId, available: result.text.length > 50, length: result.text.length, type: result.type });
     }
-    
-    return res.status(200).json({ 
-      success: true, 
-      videoId, 
-      transcript: transcript.text, 
-      type: transcript.type 
-    });
+    return res.status(200).json({ success: true, videoId, transcript: result.text, type: result.type });
   } catch (err) {
-    return res.status(200).json({ 
-      success: false, 
-      videoId, 
-      error: err.message 
-    });
+    return res.status(200).json({ success: false, videoId, error: err.message });
   }
 };
 
 async function fetchTranscript(videoId) {
-  // Step 1: Fetch the YouTube video page
-  const pageHtml = await httpGet(`https://www.youtube.com/watch?v=${videoId}`, {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept-Language': 'en',
-    'Accept': 'text/html,application/xhtml+xml',
-    'Cookie': 'CONSENT=PENDING+987; SOCS=CAESEwgDEgk2NDcwMTQxMjQaAmVuIAEaBgiA_LyaBg'
+  // Fetch YouTube video page with consent cookie
+  const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      'Accept-Language': 'en',
+      'Cookie': 'CONSENT=PENDING+987; SOCS=CAESEwgDEgk2NDcwMTQxMjQaAmVuIAEaBgiA_LyaBg'
+    },
+    redirect: 'follow'
   });
 
-  // Step 2: Extract caption tracks from ytInitialPlayerResponse
-  const playerMatch = pageHtml.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var\s|<\/script)/s);
-  if (!playerMatch) {
-    throw new Error('Could not find player response in page');
-  }
+  if (!pageResp.ok) throw new Error('Failed to fetch YouTube page: HTTP ' + pageResp.status);
+  const html = await pageResp.text();
 
-  let playerData;
-  try {
-    playerData = JSON.parse(playerMatch[1]);
-  } catch(e) {
-    throw new Error('Failed to parse player response');
-  }
+  // Extract ytInitialPlayerResponse
+  const match = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var\s|<\/script)/s);
+  if (!match) throw new Error('Could not find player data in page');
 
-  // Check if video is playable
-  const status = playerData?.playabilityStatus?.status;
+  let player;
+  try { player = JSON.parse(match[1]); }
+  catch(e) { throw new Error('Failed to parse player data'); }
+
+  // Check playability
+  const status = player?.playabilityStatus?.status;
   if (status === 'LOGIN_REQUIRED') throw new Error('Video is age-restricted or private');
   if (status === 'UNPLAYABLE') throw new Error('Video is unavailable');
   if (status === 'ERROR') throw new Error('Video not found');
 
-  const captions = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!captions || captions.length === 0) {
-    throw new Error('No captions available for this video');
-  }
+  // Get caption tracks
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks || tracks.length === 0) throw new Error('No captions available');
 
-  // Step 3: Pick the best caption track
-  // Priority: manual English > auto English > manual en-GB > auto en-GB > any
-  const track = pickTrack(captions);
-  if (!track?.baseUrl) {
-    throw new Error('No usable caption track found');
-  }
+  // Pick best English track
+  const track = pickTrack(tracks);
+  if (!track?.baseUrl) throw new Error('No usable caption track');
 
-  // Step 4: Fetch the caption content
-  const captionUrl = track.baseUrl.replace(/\\u0026/g, '&');
-  const captionContent = await httpGet(captionUrl);
+  // Decode the caption URL (YouTube uses \u0026 for &)
+  let captionUrl = track.baseUrl;
+  // Replace all forms of encoded ampersands
+  captionUrl = captionUrl.replace(/\\u0026/g, '&');
+  captionUrl = captionUrl.replace(/\u0026/g, '&');
   
-  // Step 5: Parse the caption XML
-  const text = parseCaptionXml(captionContent);
-  if (!text || text.length < 10) {
-    throw new Error('Caption track was empty');
+  // Fetch caption XML using global fetch (handles redirects properly)
+  const captionResp = await fetch(captionUrl, { redirect: 'follow' });
+  if (!captionResp.ok) throw new Error('Caption fetch failed: HTTP ' + captionResp.status);
+  const captionContent = await captionResp.text();
+
+  if (!captionContent || captionContent.length < 20) {
+    throw new Error('Caption response was empty (URL: ' + captionUrl.substring(0, 100) + '...)');
   }
+
+  // Parse XML captions
+  const text = parseCaptions(captionContent);
+  if (!text || text.length < 10) throw new Error('Caption track was empty after parsing');
 
   const type = track.kind === 'asr' ? 'auto-generated' : 'manual';
   return { text, type: `${type} (${track.languageCode})` };
 }
 
 function pickTrack(tracks) {
-  const priorities = [
+  const tests = [
     t => t.languageCode === 'en' && t.kind !== 'asr',
     t => t.languageCode === 'en' && t.kind === 'asr',
     t => t.languageCode === 'en',
     t => t.languageCode === 'en-GB',
-    t => t.languageCode?.startsWith('en'),
+    t => (t.languageCode || '').startsWith('en'),
     t => t.kind !== 'asr',
     t => true
   ];
-
-  for (const fn of priorities) {
-    const match = tracks.find(fn);
-    if (match) return match;
+  for (const test of tests) {
+    const found = tracks.find(test);
+    if (found) return found;
   }
   return tracks[0];
 }
 
-function parseCaptionXml(xml) {
-  const parts = [];
-  const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-  let match;
-  while ((match = regex.exec(xml)) !== null) {
-    let text = match[1]
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&apos;/g, "'")
-      .replace(/\n/g, ' ')
-      .trim();
-    if (text) parts.push(text);
+function parseCaptions(content) {
+  // Try XML format first
+  if (content.includes('<text')) {
+    const parts = [];
+    const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+    let m;
+    while ((m = regex.exec(content)) !== null) {
+      let t = m[1]
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+        .replace(/\n/g, ' ').trim();
+      if (t) parts.push(t);
+    }
+    if (parts.length > 0) return parts.join(' ');
   }
-  return parts.join(' ');
-}
 
-function httpGet(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    const options = {
-      headers: {
-        'Accept': '*/*',
-        ...headers
+  // Try JSON3 format
+  try {
+    const json = JSON.parse(content);
+    if (json.events) {
+      const parts = [];
+      for (const evt of json.events) {
+        if (evt.segs) {
+          for (const seg of evt.segs) {
+            if (seg.utf8 && seg.utf8.trim() && seg.utf8 !== '\n') parts.push(seg.utf8.trim());
+          }
+        }
       }
-    };
-    
-    const makeRequest = (requestUrl, redirectCount = 0) => {
-      if (redirectCount > 5) return reject(new Error('Too many redirects'));
-      
-      lib.get(requestUrl, options, (response) => {
-        // Handle redirects
-        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-          return makeRequest(response.headers.location, redirectCount + 1);
-        }
-        
-        if (response.statusCode !== 200) {
-          return reject(new Error(`HTTP ${response.statusCode}`));
-        }
-        
-        let data = '';
-        response.on('data', chunk => data += chunk);
-        response.on('end', () => resolve(data));
-        response.on('error', reject);
-      }).on('error', reject);
-    };
-    
-    makeRequest(url);
-  });
+      if (parts.length > 0) return parts.join(' ');
+    }
+  } catch(e) {}
+
+  return '';
 }
