@@ -1,5 +1,6 @@
+const { getSubtitles, getVideoDetails } = require('youtube-caption-extractor');
+
 module.exports = async (req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -10,142 +11,27 @@ module.exports = async (req, res) => {
   const action = url.searchParams.get('action') || 'transcript';
 
   if (action === 'ping') {
-    return res.status(200).json({ success: true, message: 'Transcript API v4 running' });
+    return res.status(200).json({ success: true, message: 'Transcript API v5 running' });
   }
 
   if (!videoId) return res.status(400).json({ error: 'Missing videoId parameter' });
   if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid videoId' });
 
   try {
-    const result = await fetchTranscript(videoId);
-    if (action === 'test') {
-      return res.status(200).json({ success: true, videoId, available: result.text.length > 50, length: result.text.length, type: result.type });
+    const subtitles = await getSubtitles({ videoID: videoId, lang: 'en' });
+    
+    if (!subtitles || subtitles.length === 0) {
+      return res.status(200).json({ success: false, videoId, error: 'No captions available' });
     }
-    return res.status(200).json({ success: true, videoId, transcript: result.text, type: result.type });
+
+    const transcript = subtitles.map(s => s.text).join(' ');
+
+    if (action === 'test') {
+      return res.status(200).json({ success: true, videoId, available: transcript.length > 50, length: transcript.length });
+    }
+
+    return res.status(200).json({ success: true, videoId, transcript, type: 'caption' });
   } catch (err) {
     return res.status(200).json({ success: false, videoId, error: err.message });
   }
 };
-
-async function fetchTranscript(videoId) {
-  // Fetch YouTube video page with consent cookie
-  const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      'Accept-Language': 'en',
-      'Cookie': 'CONSENT=PENDING+987; SOCS=CAESEwgDEgk2NDcwMTQxMjQaAmVuIAEaBgiA_LyaBg'
-    },
-    redirect: 'follow'
-  });
-
-  if (!pageResp.ok) throw new Error('Failed to fetch YouTube page: HTTP ' + pageResp.status);
-  const html = await pageResp.text();
-
-  // Extract ytInitialPlayerResponse
-  const match = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var\s|<\/script)/s);
-  if (!match) throw new Error('Could not find player data in page');
-
-  let player;
-  try { player = JSON.parse(match[1]); }
-  catch(e) { throw new Error('Failed to parse player data'); }
-
-  // Check playability
-  const status = player?.playabilityStatus?.status;
-  if (status === 'LOGIN_REQUIRED') throw new Error('Video is age-restricted or private');
-  if (status === 'UNPLAYABLE') throw new Error('Video is unavailable');
-  if (status === 'ERROR') throw new Error('Video not found');
-
-  // Get caption tracks
-  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks || tracks.length === 0) throw new Error('No captions available');
-
-  // Pick best English track
-  const track = pickTrack(tracks);
-  if (!track?.baseUrl) throw new Error('No usable caption track');
-
-  // Decode the caption URL (YouTube uses \u0026 for &)
-  let captionUrl = track.baseUrl;
-  captionUrl = captionUrl.replace(/\\u0026/g, '&');
-  captionUrl = captionUrl.replace(/\u0026/g, '&');
-  
-  // Try multiple format parameters — YouTube sometimes returns empty without fmt
-  const formats = ['srv3', 'srv1', 'json3', ''];
-  let captionContent = '';
-  
-  for (const fmt of formats) {
-    const tryUrl = fmt ? captionUrl + '&fmt=' + fmt : captionUrl;
-    try {
-      const captionResp = await fetch(tryUrl, { redirect: 'follow' });
-      if (captionResp.ok) {
-        const text = await captionResp.text();
-        if (text && text.length > 20) {
-          captionContent = text;
-          break;
-        }
-      }
-    } catch(e) { continue; }
-  }
-
-  if (!captionContent || captionContent.length < 20) {
-    throw new Error('All caption formats returned empty for this video');
-  }
-
-  // Parse XML captions
-  const text = parseCaptions(captionContent);
-  if (!text || text.length < 10) throw new Error('Caption track was empty after parsing');
-
-  const type = track.kind === 'asr' ? 'auto-generated' : 'manual';
-  return { text, type: `${type} (${track.languageCode})` };
-}
-
-function pickTrack(tracks) {
-  const tests = [
-    t => t.languageCode === 'en' && t.kind !== 'asr',
-    t => t.languageCode === 'en' && t.kind === 'asr',
-    t => t.languageCode === 'en',
-    t => t.languageCode === 'en-GB',
-    t => (t.languageCode || '').startsWith('en'),
-    t => t.kind !== 'asr',
-    t => true
-  ];
-  for (const test of tests) {
-    const found = tracks.find(test);
-    if (found) return found;
-  }
-  return tracks[0];
-}
-
-function parseCaptions(content) {
-  // Try XML format first
-  if (content.includes('<text')) {
-    const parts = [];
-    const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-    let m;
-    while ((m = regex.exec(content)) !== null) {
-      let t = m[1]
-        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
-        .replace(/\n/g, ' ').trim();
-      if (t) parts.push(t);
-    }
-    if (parts.length > 0) return parts.join(' ');
-  }
-
-  // Try JSON3 format
-  try {
-    const json = JSON.parse(content);
-    if (json.events) {
-      const parts = [];
-      for (const evt of json.events) {
-        if (evt.segs) {
-          for (const seg of evt.segs) {
-            if (seg.utf8 && seg.utf8.trim() && seg.utf8 !== '\n') parts.push(seg.utf8.trim());
-          }
-        }
-      }
-      if (parts.length > 0) return parts.join(' ');
-    }
-  } catch(e) {}
-
-  return '';
-}
