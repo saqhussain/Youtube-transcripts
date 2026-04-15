@@ -1,5 +1,3 @@
-const { getSubtitles, getVideoDetails } = require('youtube-caption-extractor');
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -18,6 +16,9 @@ module.exports = async (req, res) => {
   if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid videoId' });
 
   try {
+    // Dynamic import for ES module package
+    const { getSubtitles } = await import('youtube-caption-extractor');
+    
     const subtitles = await getSubtitles({ videoID: videoId, lang: 'en' });
     
     if (!subtitles || subtitles.length === 0) {
@@ -32,6 +33,6 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({ success: true, videoId, transcript, type: 'caption' });
   } catch (err) {
-    return res.status(200).json({ success: false, videoId, error: err.message });
+    return res.status(200).json({ success: false, videoId, error: err.message || String(err) });
   }
 };
