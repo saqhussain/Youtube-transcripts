@@ -65,17 +65,29 @@ async function fetchTranscript(videoId) {
 
   // Decode the caption URL (YouTube uses \u0026 for &)
   let captionUrl = track.baseUrl;
-  // Replace all forms of encoded ampersands
   captionUrl = captionUrl.replace(/\\u0026/g, '&');
   captionUrl = captionUrl.replace(/\u0026/g, '&');
   
-  // Fetch caption XML using global fetch (handles redirects properly)
-  const captionResp = await fetch(captionUrl, { redirect: 'follow' });
-  if (!captionResp.ok) throw new Error('Caption fetch failed: HTTP ' + captionResp.status);
-  const captionContent = await captionResp.text();
+  // Try multiple format parameters — YouTube sometimes returns empty without fmt
+  const formats = ['srv3', 'srv1', 'json3', ''];
+  let captionContent = '';
+  
+  for (const fmt of formats) {
+    const tryUrl = fmt ? captionUrl + '&fmt=' + fmt : captionUrl;
+    try {
+      const captionResp = await fetch(tryUrl, { redirect: 'follow' });
+      if (captionResp.ok) {
+        const text = await captionResp.text();
+        if (text && text.length > 20) {
+          captionContent = text;
+          break;
+        }
+      }
+    } catch(e) { continue; }
+  }
 
   if (!captionContent || captionContent.length < 20) {
-    throw new Error('Caption response was empty (URL: ' + captionUrl.substring(0, 100) + '...)');
+    throw new Error('All caption formats returned empty for this video');
   }
 
   // Parse XML captions
